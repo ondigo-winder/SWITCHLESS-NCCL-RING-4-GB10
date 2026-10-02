@@ -1,0 +1,11 @@
+SWITCHLESS-NCCL-RING-4-GB10
+Copyright 2026 Friso van Dort
+
+This repository contains a patch to NVIDIA NCCL (https://github.com/NVIDIA/nccl),
+which is distributed under NVIDIA's NCCL licence.
+
+The patch builds on the switchless-nccl patches published by Alex Ellis,
+OpenFaaS Ltd (https://github.com/alexellis/switchless-nccl), which in turn
+build on the switchless patches published by SparkRing
+(https://github.com/FujitsuPolycom/sparkring). Those patches are Apache-2.0 and
+are not included in this repository.
