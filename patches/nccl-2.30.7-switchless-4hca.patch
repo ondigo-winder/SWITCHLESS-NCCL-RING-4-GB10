@@ -1,0 +1,275 @@
+diff --git a/src/transport/net_ib/connect.cc b/src/transport/net_ib/connect.cc
+index 7e803d5..39536db 100644
+--- a/src/transport/net_ib/connect.cc
++++ b/src/transport/net_ib/connect.cc
+@@ -50,6 +50,9 @@ struct ncclIbCommStage {
+   void* comm;
+ };
+ 
++#define NCCL_IB_SWITCHLESS_MAX_GIDS 4
++#define NCCL_IB_SWITCHLESS_TAG 0x53344843u /* 'S4HC' */
++
+ struct ncclIbHandle {
+   union ncclSocketAddress connectAddr; // Filled by the target
+   uint64_t magic; // random number to help debugging
+@@ -57,8 +60,20 @@ struct ncclIbHandle {
+   // GIDs of the listener's device PFs, used by the connector to find a local
+   // NIC on the same subnet (for multi-subnet RoCE direct-connect topologies).
+   // Zero-valued slots are ignored (validGid() returns false).
+-  union ibv_gid listenGids[2];
++  // Modified by switchless-4hca: in switchless mode the same 32 bytes carry up
++  // to four IPv4 addresses (RoCEv2 IPv4-mapped GIDs) instead of two full GIDs,
++  // because four full GIDs would make the handle exactly 128 bytes (too large).
++  union {
++    union ibv_gid listenGids[2];
++    struct {
++      uint32_t tag;
++      uint32_t count;
++      uint32_t ipv4[NCCL_IB_SWITCHLESS_MAX_GIDS];
++    } compact;
++  };
+ };
++static_assert(sizeof(((struct ncclIbHandle*)0)->compact) <= 2 * sizeof(union ibv_gid),
++              "switchless compact listener GIDs must fit in the listenGids space");
+ 
+ NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
+ NCCL_PARAM(IbSubnetAwareRouting, "IB_SUBNET_AWARE_ROUTING", 0);
+@@ -524,7 +539,33 @@ static bool subnetMatchesAny(union ibv_gid* localGid, union ibv_gid* remoteGids,
+ // and IB deployments.
+ // Checks the default device first to preserve NIC Fusion when all PFs in
+ // the fused device can reach the peer (e.g., 2-node or switch setup).
+-static ncclResult_t ncclIbFindDevBySubnet(union ibv_gid* remoteGids, int nRemoteGids, int defaultDev, int* foundDev) {
++// Modified by switchless-4hca: does every RoCE PF of merged device devIdx share
++// a subnet with one of the remote GIDs? (Same criterion as upstream.)
++static bool ncclIbDevMatchesSubnet(int devIdx, union ibv_gid* remoteGids, int nRemoteGids, int prefixLen) {
++  struct ncclIbMergedDev* mDev = ncclIbMergedDevs + devIdx;
++  int checked = 0, matched = 0;
++  for (int i = 0; i < mDev->vProps.ndevs; i++) {
++    int ibDevN = mDev->vProps.devs[i];
++    ncclIbDev* ibDev = ncclIbDevs + ibDevN;
++    if (ibDev->portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
++    int gidIndex = 0;
++    union ibv_gid localGid;
++    memset(&localGid, 0, sizeof(localGid));
++    if (ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex) != ncclSuccess) continue;
++    if (wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &localGid) != ncclSuccess) continue;
++    checked++;
++    if (validGid(&localGid) && subnetMatchesAny(&localGid, remoteGids, nRemoteGids, prefixLen)) matched++;
++  }
++  return checked > 0 && matched == checked;
++}
++
++// Given remote GIDs, find a local merged IB device that shares a subnet with
++// them. Keeps defaultDev when it already matches. Upstream takes the first
++// matching device; in switchless mode several devices (both PCIe halves of one
++// cable) can match, so the choice is spread over them: the k-th non-matching
++// default device maps to candidate k modulo the number of candidates.
++static ncclResult_t ncclIbFindDevBySubnet(union ibv_gid* remoteGids, int nRemoteGids, int defaultDev, int* foundDev,
++                                           bool logChoice) {
+   *foundDev = defaultDev;
+ 
+   int prefixLen = ncclParamIbSubnetPrefixLen();
+@@ -533,7 +574,6 @@ static ncclResult_t ncclIbFindDevBySubnet(union ibv_gid* remoteGids, int nRemote
+     return ncclInvalidArgument;
+   }
+ 
+-  // Quick check: if no remote GID is valid, nothing to do.
+   bool anyValid = false;
+   for (int r = 0; r < nRemoteGids; r++) {
+     if (validGid(&remoteGids[r])) {
+@@ -543,55 +583,65 @@ static ncclResult_t ncclIbFindDevBySubnet(union ibv_gid* remoteGids, int nRemote
+   }
+   if (!anyValid) return ncclSuccess;
+ 
+-  // First: check if the default device already works. If ALL its RoCE PFs
+-  // match some remote GID's subnet, keep it — this preserves NIC Fusion
+-  // bandwidth when both ports connect to the same destination.
+-  if (defaultDev >= 0 && defaultDev < ncclNMergedIbDevs) {
+-    struct ncclIbMergedDev* mDev = ncclIbMergedDevs + defaultDev;
+-    int checked = 0, matched = 0;
+-    for (int i = 0; i < mDev->vProps.ndevs; i++) {
+-      int ibDevN = mDev->vProps.devs[i];
+-      ncclIbDev* ibDev = ncclIbDevs + ibDevN;
+-      if (ibDev->portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
+-      int gidIndex = 0;
+-      union ibv_gid localGid;
+-      memset(&localGid, 0, sizeof(localGid));
+-      if (ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex) != ncclSuccess) continue;
+-      if (wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &localGid) != ncclSuccess) continue;
+-      checked++;
+-      if (validGid(&localGid) && subnetMatchesAny(&localGid, remoteGids, nRemoteGids, prefixLen)) matched++;
+-    }
+-    if (checked > 0 && matched == checked) return ncclSuccess;
+-  }
++  if (defaultDev >= 0 && defaultDev < ncclNMergedIbDevs &&
++      ncclIbDevMatchesSubnet(defaultDev, remoteGids, nRemoteGids, prefixLen))
++    return ncclSuccess;
+ 
+-  // Default device can't fully reach the peer (e.g., NIC Fusion fused PFs on
+-  // different subnets, or the device is on the wrong subnet entirely).
+-  // Search for a device whose RoCE PFs all match a remote GID's subnet.
+-  // Same "all PFs must match" criterion as the defaultDev check: NCCL takes
+-  // a merged-device index and spreads QPs across all its PFs, so a partial
+-  // match would leave some QPs on PFs with no L2 path to the peer.
++  int candidates[MAX_IB_VDEVS];
++  int nCand = 0, defaultRank = 0;
+   for (int devIdx = 0; devIdx < ncclNMergedIbDevs; devIdx++) {
+     if (devIdx == defaultDev) continue;
+-    struct ncclIbMergedDev* mDev = ncclIbMergedDevs + devIdx;
+-    int checked = 0, matched = 0;
+-    for (int i = 0; i < mDev->vProps.ndevs; i++) {
+-      int ibDevN = mDev->vProps.devs[i];
+-      ncclIbDev* ibDev = ncclIbDevs + ibDevN;
+-      if (ibDev->portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
+-      int gidIndex = 0;
+-      union ibv_gid localGid;
+-      memset(&localGid, 0, sizeof(localGid));
+-      if (ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex) != ncclSuccess) continue;
+-      if (wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &localGid) != ncclSuccess) continue;
+-      checked++;
+-      if (validGid(&localGid) && subnetMatchesAny(&localGid, remoteGids, nRemoteGids, prefixLen)) matched++;
+-    }
+-    if (checked > 0 && matched == checked) {
+-      INFO(NCCL_NET, "NET/IB: Subnet-aware routing: overriding dev %d with dev %d", defaultDev, devIdx);
+-      *foundDev = devIdx;
+-      return ncclSuccess;
++    if (ncclIbDevMatchesSubnet(devIdx, remoteGids, nRemoteGids, prefixLen)) {
++      candidates[nCand++] = devIdx;
++    } else if (devIdx < defaultDev) {
++      defaultRank++;
+     }
+   }
++  if (nCand == 0) return ncclSuccess;
++
++  int pick = ncclSwitchlessRingOnly() ? candidates[defaultRank % nCand] : candidates[0];
++  // The connector re-enters this on every progress call; it logs only once.
++  if (logChoice)
++    INFO(NCCL_NET, "NET/IB: Subnet-aware routing: overriding dev %d with dev %d (%d candidates)", defaultDev, pick,
++         nCand);
++  *foundDev = pick;
++  return ncclSuccess;
++}
++
++// Modified by switchless-4hca: IPv4-mapped GID <-> IPv4 address.
++static bool ncclIbGidToIpv4(const union ibv_gid* gid, uint32_t* ip) {
++  for (int i = 0; i < 10; i++)
++    if (gid->raw[i] != 0) return false;
++  if (gid->raw[10] != 0xff || gid->raw[11] != 0xff) return false;
++  memcpy(ip, gid->raw + 12, sizeof(*ip));
++  return *ip != 0;
++}
++
++static void ncclIbIpv4ToGid(uint32_t ip, union ibv_gid* gid) {
++  memset(gid, 0, sizeof(*gid));
++  gid->raw[10] = 0xff;
++  gid->raw[11] = 0xff;
++  memcpy(gid->raw + 12, &ip, sizeof(ip));
++}
++
++// Remote listener GIDs from a handle, in whichever form the listener wrote.
++static ncclResult_t ncclIbHandleGetListenGids(struct ncclIbHandle* handle, union ibv_gid* gids, int* nGids) {
++  if (!ncclSwitchlessRingOnly()) {
++    gids[0] = handle->listenGids[0];
++    gids[1] = handle->listenGids[1];
++    *nGids = 2;
++    return ncclSuccess;
++  }
++  if (handle->compact.tag != NCCL_IB_SWITCHLESS_TAG) {
++    WARN("SWITCHLESS/4HCA: peer handle lacks the switchless-4hca tag; every rank must run the same patched NCCL");
++    return ncclInvalidUsage;
++  }
++  if (handle->compact.count < 1 || handle->compact.count > NCCL_IB_SWITCHLESS_MAX_GIDS) {
++    WARN("SWITCHLESS/4HCA: peer handle carries %u listener addresses", handle->compact.count);
++    return ncclInvalidUsage;
++  }
++  for (uint32_t i = 0; i < handle->compact.count; i++) ncclIbIpv4ToGid(handle->compact.ipv4[i], gids + i);
++  *nGids = (int)handle->compact.count;
+   return ncclSuccess;
+ }
+ 
+@@ -630,7 +680,11 @@ ncclResult_t ncclIbListen(void* ctx, int dev, void* opaqueHandle, void** listenC
+         goto fail;
+       }
+ 
++      // Modified by switchless-4hca: advertise every selected RoCE device
++      // (2 = one half per cable, 4 = both PCIe halves of both cables).
++      union ibv_gid gids[NCCL_IB_SWITCHLESS_MAX_GIDS];
+       int gidSlot = 0;
++      handle->compact.tag = NCCL_IB_SWITCHLESS_TAG;
+       for (int devIdx = 0; devIdx < ncclNMergedIbDevs; devIdx++) {
+         struct ncclIbMergedDev* mDev = ncclIbMergedDevs + devIdx;
+         for (int i = 0; i < mDev->vProps.ndevs; i++) {
+@@ -643,29 +697,39 @@ ncclResult_t ncclIbListen(void* ctx, int dev, void* opaqueHandle, void** listenC
+           NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex), ret, fail);
+           NCCLCHECKGOTO(wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &gid), ret, fail);
+           if (!validGid(&gid)) continue;
+-          if (gidSlot > 0 && memcmp(&handle->listenGids[0], &gid, sizeof(gid)) == 0) {
+-            WARN("SWITCHLESS/HARDENED: duplicate listener GID on IbDev %d Port %d", ibDevN, ibDev->portNum);
++          for (int k = 0; k < gidSlot; k++) {
++            if (memcmp(&gids[k], &gid, sizeof(gid)) == 0) {
++              WARN("SWITCHLESS/HARDENED: duplicate listener GID on IbDev %d Port %d", ibDevN, ibDev->portNum);
++              ret = ncclInvalidUsage;
++              goto fail;
++            }
++          }
++          if (gidSlot == NCCL_IB_SWITCHLESS_MAX_GIDS) {
++            WARN("SWITCHLESS/4HCA: more than %d eligible listener GIDs", NCCL_IB_SWITCHLESS_MAX_GIDS);
+             ret = ncclInvalidUsage;
+             goto fail;
+           }
+-          if (gidSlot == 2) {
+-            WARN("SWITCHLESS/HARDENED: more than two eligible listener GIDs");
++          uint32_t ip;
++          if (!ncclIbGidToIpv4(&gid, &ip)) {
++            WARN("SWITCHLESS/4HCA: listener GID on IbDev %d is not an IPv4-mapped RoCEv2 GID (check NCCL_IB_GID_INDEX)",
++                 ibDevN);
+             ret = ncclInvalidUsage;
+             goto fail;
+           }
+ 
+-          handle->listenGids[gidSlot] = gid;
+-          INFO(NCCL_NET,
+-               "SWITCHLESS/HARDENED: listener slot %d IbDev %d Port %d GID %d (%lX/%lX)", gidSlot, ibDevN,
+-               ibDev->portNum, gidIndex, (uint64_t)gid.global.subnet_prefix, (uint64_t)gid.global.interface_id);
++          gids[gidSlot] = gid;
++          handle->compact.ipv4[gidSlot] = ip;
++          INFO(NCCL_NET, "SWITCHLESS/4HCA: listener slot %d IbDev %d (%s) Port %d GID %d %u.%u.%u.%u", gidSlot, ibDevN,
++               ibDev->devName, ibDev->portNum, gidIndex, gid.raw[12], gid.raw[13], gid.raw[14], gid.raw[15]);
+           gidSlot++;
+         }
+       }
+-      if (gidSlot != 2) {
+-        WARN("SWITCHLESS/HARDENED: expected exactly two eligible listener GIDs, found %d", gidSlot);
++      if (gidSlot != 2 && gidSlot != 4) {
++        WARN("SWITCHLESS/4HCA: expected 2 or 4 eligible listener GIDs, found %d", gidSlot);
+         ret = ncclInvalidUsage;
+         goto fail;
+       }
++      handle->compact.count = gidSlot;
+     }
+   }
+ 
+@@ -846,7 +910,13 @@ ncclResult_t ncclIbConnectImpl(void* ctx, int dev, void* opaqueHandle, void** se
+   // Subnet-aware device selection: use the listener's GIDs (embedded in the
+   // handle) to find a local NIC on the same subnet as the remote peer.
+   // For single-subnet or IB deployments, all GIDs are zero → dev stays unchanged.
+-  if (ncclParamIbSubnetAwareRouting()) NCCLCHECK(ncclIbFindDevBySubnet(handle->listenGids, 2, dev, &dev));
++  if (ncclParamIbSubnetAwareRouting()) {
++    union ibv_gid remoteGids[NCCL_IB_SWITCHLESS_MAX_GIDS];
++    int nRemoteGids = 0;
++    NCCLCHECK(ncclIbHandleGetListenGids(handle, remoteGids, &nRemoteGids));
++    NCCLCHECK(ncclIbFindDevBySubnet(remoteGids, nRemoteGids, dev, &dev,
++                                    handle->stage.state == ncclIbCommStateStart));
++  }
+ 
+   struct ncclIbCommStage* stage = &handle->stage;
+   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
+@@ -1518,7 +1588,7 @@ ib_recv:
+       }
+     }
+     int effectiveDev = lComm->dev;
+-    NCCLCHECKGOTO(ncclIbFindDevBySubnet(remoteGids, nRemoteGids, lComm->dev, &effectiveDev), ret, fail);
++    NCCLCHECKGOTO(ncclIbFindDevBySubnet(remoteGids, nRemoteGids, lComm->dev, &effectiveDev, true), ret, fail);
+     if (effectiveDev != lComm->dev) {
+       lComm->dev = effectiveDev;
+       rComm->base.vProps = ncclIbMergedDevs[effectiveDev].vProps;

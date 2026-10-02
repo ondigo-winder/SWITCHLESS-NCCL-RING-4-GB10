@@ -1,0 +1,2 @@
+for d in rocep1s0f0 rocep1s0f1 roceP2p1s0f0 roceP2p1s0f1; do h=/sys/class/infiniband/$d/ports/1/hw_counters; printf "%s " $d; for c in out_of_sequence packet_seq_err local_ack_timeout_err rnr_nak_retry_err implied_nak_seq_err duplicate_request; do printf "%s=%s " $c $(cat $h/$c 2>/dev/null); done; echo; done
+for i in enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1; do printf "%s " $i; ethtool -S $i 2>/dev/null | grep -E " (rx_crc_errors_phy|rx_symbol_err_phy|rx_discards_phy|rx_out_of_buffer|tx_discards_phy):" | tr -s " " | tr "\n" " "; echo; done
