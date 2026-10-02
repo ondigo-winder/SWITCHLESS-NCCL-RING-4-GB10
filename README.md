@@ -9,7 +9,7 @@ It is one extra patch on top of the hardened switchless NCCL 2.30.7 from
 With the old settings (two HCAs) it behaves exactly like v0.0.1.
 
 > Status: experimental. Tested on one 4-node cluster with collective benchmarks,
-> including after a reboot of all nodes (results below). Not yet tested under vLLM.
+> after a reboot of all nodes, and under vLLM with tensor parallelism 4 (results below).
 
 ## Why
 
@@ -85,6 +85,11 @@ NCCL_SWITCHLESS_RING_ONLY=1        # required
 NCCL_IB_SUBNET_AWARE_ROUTING=1     # required
 NCCL_IB_MERGE_NICS=0               # required
 ```
+
+With vLLM, also set `VLLM_NCCL_SO_PATH` to the same library. The optional
+`deep_ep` module then logs a `Duplicate NCCL runtime found` warning at start-up
+and is skipped; it is only used for MoE expert parallelism and did not affect
+the tensor-parallel test.
 
 Every rank must use this build. A rank running v0.0.1 or stock NCCL is rejected
 during connection setup.
