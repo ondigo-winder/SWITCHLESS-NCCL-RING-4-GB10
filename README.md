@@ -26,17 +26,23 @@ With the old settings (two HCAs) it behaves exactly like v0.0.1.
 Raw RDMA over both halves of one cable tops out at ~196 Gb/s, so the collective
 reaches ~98% of what the cable carries.
 
-vLLM, tensor parallelism 4, prefill of 4,096-token prompts:
+vLLM, tensor parallelism 4, throughput in tokens/s. Prefill: 4,096-token
+prompts, 16 concurrent. Decode: 256 in / 256 out, 32 concurrent.
 
-| Model | v0.0.1 | this patch | Gain |
-| --- | --- | --- | --- |
-| Qwen2.5-72B-Instruct, BF16 | 893 tok/s | 982 tok/s | +10% |
-| Qwen2.5-72B-Instruct, FP8 | 1,482 tok/s | 1,801 tok/s | +22% |
-| Llama-3.3-70B-Instruct, NVFP4 | 1,945 tok/s | 2,605 tok/s | +34% |
-| Qwen3.5-397B-A17B, NVFP4 (MoE) | 2,066 tok/s | 2,601 tok/s | +26% |
+| Model | Prefill v0.0.1 | Prefill this patch | Gain | Decode v0.0.1 | Decode this patch | Gain |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen2.5-72B-Instruct, BF16 | 893 | 982 | +10% | 132 | 135 | +2% |
+| Qwen2.5-72B-Instruct, FP8 | 1,482 | 1,801 | +22% | 221 | 231 | +4% |
+| Llama-3.3-70B-Instruct, NVFP4 | 1,945 | 2,605 | +34% | 341 | 367 | +8% |
+| Qwen3.5-397B-A17B, NVFP4 (MoE) | 2,066 | 2,601 | +26% | 204 | 215 | +5% |
 
-The faster the model computes per token, the more it gains. Decode gains 2–8%
-(latency-bound). One run per configuration; treat the percentages as indicative.
+Every model was faster in both phases in these runs. Prefill gains most, and
+more the faster the model computes per token. Decode gains 2–8% because it is
+latency-bound (many small all-reduces per step); the smallest decode gains
+(BF16, FP8) are within run-to-run noise. Time per output token drops accordingly, for
+example 85 → 80 ms for Llama-3.3-70B NVFP4. One run per configuration; treat the
+percentages as indicative. Full numbers, including time to first token and
+network load, are in the [results](results/2026-10-gb10-ring.md).
 
 ## Why
 
