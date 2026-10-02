@@ -9,7 +9,8 @@ It is one extra patch on top of the hardened switchless NCCL 2.30.7 from
 With the old settings (two HCAs) it behaves exactly like v0.0.1.
 
 > Status: experimental. Tested on one 4-node cluster with collective benchmarks,
-> after a reboot of all nodes, and under vLLM with tensor parallelism 4 (results below).
+> after a reboot of all nodes, and under vLLM with tensor parallelism 4, including
+> Qwen2.5-72B-Instruct in BF16 (results below).
 
 ## Why
 
@@ -126,6 +127,10 @@ Small messages are latency-bound and gain little.
 all_gather, reduce_scatter, broadcast, reduce and neighbour send/recv gain the
 same way (172 to 196 Gb/s). Send/recv between opposite nodes and all-to-all do
 not work on a switchless ring, with or without this patch: no expert parallelism.
+
+Under vLLM with Qwen2.5-72B-Instruct (BF16, TP4) the fabric is far from full
+(about 30 Gb/s per cable during prefill), yet prefill ran about 10% faster than with
+v0.0.1; decode was the same within noise. See the results file for the details.
 
 GPUDirect RDMA is reported as disabled on this platform, also with stock NCCL.
 NCCL stages through system memory, which on GB10 is the same unified LPDDR5X as
