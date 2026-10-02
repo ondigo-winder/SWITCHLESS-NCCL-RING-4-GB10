@@ -99,6 +99,8 @@ during connection setup.
 `tests/allreduce.cu` is a minimal all-reduce benchmark (no MPI or PyTorch).
 `tests/run-ring.sh` starts it on every node over SSH + Docker.
 `tests/counters.sh` prints the RoCE and PHY error counters for a before/after check.
+`tests/collectives.cu` checks all_gather, reduce_scatter, broadcast, reduce and
+send/recv, plus the two operations a switchless ring cannot carry.
 
 ```bash
 # on every node, inside a CUDA 13 container, link against the patched library:
@@ -120,6 +122,10 @@ See [`results/2026-10-gb10-ring.md`](results/2026-10-gb10-ring.md). In short, 4 
 Raw RDMA (`ib_write_bw`, both halves of one cable at once) tops out at about
 196 Gb/s, so the collective now reaches about 98% of what the cable carries.
 Small messages are latency-bound and gain little.
+
+all_gather, reduce_scatter, broadcast, reduce and neighbour send/recv gain the
+same way (172 to 196 Gb/s). Send/recv between opposite nodes and all-to-all do
+not work on a switchless ring, with or without this patch: no expert parallelism.
 
 GPUDirect RDMA is reported as disabled on this platform, also with stock NCCL.
 NCCL stages through system memory, which on GB10 is the same unified LPDDR5X as
