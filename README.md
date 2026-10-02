@@ -8,8 +8,8 @@ It is one extra patch on top of the hardened switchless NCCL 2.30.7 from
 [alexellis/switchless-nccl](https://github.com/alexellis/switchless-nccl) v0.0.1.
 With the old settings (two HCAs) it behaves exactly like v0.0.1.
 
-> Status: experimental. Tested on one 4-node cluster with collective benchmarks
-> (results below). Not yet tested under vLLM or across a reboot.
+> Status: experimental. Tested on one 4-node cluster with collective benchmarks,
+> including after a reboot of all nodes (results below). Not yet tested under vLLM.
 
 ## Why
 
